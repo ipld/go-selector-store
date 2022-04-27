@@ -4,21 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
-	"errors"
 	"io"
 
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
-	dshelp "github.com/ipfs/go-ipfs-ds-help"
-	util "github.com/ipld/go-car/util"
 	"github.com/ipld/go-ipld-prime"
-	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	"github.com/ipld/go-ipld-prime/datamodel"
 	"github.com/ipld/go-ipld-prime/linking"
-	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
+	"github.com/ipld/go-selector-store/internal/encoding"
 	selectorstore "github.com/ipld/go-selector-store/pkg"
-	mh "github.com/multiformats/go-multihash"
 )
 
 type simpleSelectorStore struct {
@@ -31,72 +25,6 @@ func NewSimpleSelectorStore(ds datastore.Datastore) selectorstore.Store {
 	}
 }
 
-// toDsKey converts a cid+selector to a go-datastore key
-func toDsKey(root cid.Cid, selector ipld.Node) (datastore.Key, error) {
-	buf := new(bytes.Buffer)
-	// write the multihash of the cid
-	mhw := mh.NewWriter(buf)
-	err := mhw.WriteMultihash(root.Hash())
-	if err != nil {
-		return datastore.Key{}, err
-	}
-	// encode the selector as cbor
-	err = dagcbor.Encode(selector, mhw)
-	if err != nil {
-		return datastore.Key{}, err
-	}
-	data := buf.Bytes()
-	// return byte buffer encoded to ds key
-	return dshelp.NewKeyFromBinary(data), nil
-}
-
-// encodeTraversedLink writes a traversed link to a store
-// writes:
-// varint for length of all +
-// cid (contains length) + path len varint + path string as bytes + error string (nothing for nil error)
-func encodeTraversedLink(out io.Writer, traversedLink selectorstore.TraversedLink) error {
-	// get cid bytes (cid encodes length on its own)
-	cidBytes := traversedLink.Link.(cidlink.Link).Bytes()
-	// write the path to a byte arrach
-	pathBytes := []byte(traversedLink.LinkPath.String())
-	// encode path length as varint
-	pathLenBytes := make([]byte, binary.MaxVarintLen64)
-	written := binary.PutUvarint(pathLenBytes, uint64(len(pathBytes)))
-	pathLenBytes = pathLenBytes[:written]
-	// encode error string as bytes, do not write nil error
-	var errBytes []byte
-	if traversedLink.LoadError != nil {
-		errBytes = []byte(traversedLink.LoadError.Error())
-	}
-	// return
-	return util.LdWrite(out, cidBytes, pathLenBytes, pathBytes, errBytes)
-}
-
-// decodeTraversedLink reads a traversed link data structure from a stream
-func decodeTraversedLink(in *bufio.Reader) (selectorstore.TraversedLink, error) {
-	data, err := util.LdRead(in)
-	if err != nil {
-		return selectorstore.TraversedLink{}, err
-	}
-	c, n, err := util.ReadCid(data)
-	if err != nil {
-		return selectorstore.TraversedLink{}, err
-	}
-	data = data[n:]
-	pathLen, n := binary.Uvarint(data)
-	if n <= 0 {
-		return selectorstore.TraversedLink{}, errors.New("could not read pathLen")
-	}
-	data = data[n:]
-	path := datamodel.ParsePath(string(data[:pathLen]))
-	data = data[pathLen:]
-	var linkErr error
-	if len(data) > 0 {
-		linkErr = errors.New(string(data))
-	}
-	return selectorstore.TraversedLink{cidlink.Link{Cid: c}, path, linkErr}, nil
-}
-
 // linkIterator implements the selectorstore.LinkIterator interface
 type linkIterator struct {
 	reader *bufio.Reader
@@ -104,7 +32,7 @@ type linkIterator struct {
 
 func (li *linkIterator) Iterate(processLink func(selectorstore.TraversedLink) error) error {
 	for {
-		nextTraversedLink, err := decodeTraversedLink(li.reader)
+		nextTraversedLink, err := encoding.DecodeTraversedLink(li.reader)
 		if err != nil {
 			if err == io.EOF {
 				return nil
@@ -138,7 +66,7 @@ func (tw *traversalWriter) load(linkCtx linking.LinkContext, link datamodel.Link
 		LinkPath:  linkCtx.LinkPath,
 		LoadError: err,
 	}
-	encodeErr := encodeTraversedLink(tw.out, traversedLink)
+	encodeErr := encoding.EncodeTraversedLink(tw.out, traversedLink)
 	// record encodeErr
 	if encodeErr != nil {
 		tw.writeErr = encodeErr
@@ -155,7 +83,7 @@ func (tw *traversalWriter) commit() error {
 }
 
 func (sss *simpleSelectorStore) NewTraversal(ctx context.Context, root cid.Cid, selector datamodel.Node, underlyingLoader linking.BlockReadOpener) (linking.BlockReadOpener, selectorstore.TraversalCloser, error) {
-	key, err := toDsKey(root, selector)
+	key, err := encoding.ToDsKey(root, selector)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -164,7 +92,7 @@ func (sss *simpleSelectorStore) NewTraversal(ctx context.Context, root cid.Cid, 
 }
 
 func (sss *simpleSelectorStore) Has(ctx context.Context, root cid.Cid, selector ipld.Node) (bool, error) {
-	key, err := toDsKey(root, selector)
+	key, err := encoding.ToDsKey(root, selector)
 	if err != nil {
 		return false, err
 	}
@@ -172,7 +100,7 @@ func (sss *simpleSelectorStore) Has(ctx context.Context, root cid.Cid, selector 
 }
 
 func (sss *simpleSelectorStore) Get(ctx context.Context, root cid.Cid, selector ipld.Node) (selectorstore.LinkIterator, error) {
-	key, err := toDsKey(root, selector)
+	key, err := encoding.ToDsKey(root, selector)
 	if err != nil {
 		return nil, err
 	}
